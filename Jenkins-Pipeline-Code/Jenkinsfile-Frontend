@@ -1,0 +1,113 @@
+pipeline {
+    agent any 
+    tools {
+        jdk 'java'
+        nodejs 'nodejs'
+    }
+    
+     environment {
+        SCANNER_HOME=tool 'sonar-scanner'
+        DOCKER_ID = 'docker_id'
+        BUILD_NUMBER = "${env.BUILD_NUMBER}"
+        FRONTEND_IMAGE = "houcemdevops/frontend-todo"
+      
+    }
+
+   
+    stages {
+        stage('Cleaning Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Checkout from Git') {
+            steps {
+                git credentialsId: 'id_gitlab', url: 'https://repo-dev.efi-academy.com/houcem/kubernetes-three-tier-devsecops-project.git'
+            }
+        }
+        stage('Sonarqube Analysis') {
+            steps {
+                dir('Application-Code/frontend') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh ''' $SCANNER_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=three-tier-frontend \
+                        -Dsonar.projectKey=three-tier-frontend '''
+                    }
+                }
+            }
+        }
+        stage('Quality Check') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token' 
+                }
+            }
+        }
+        stage('OWASP Dependency-Check Scan') {
+            steps {
+                dir('Application-Code/backend') {
+                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+        stage('Trivy File Scan') {
+            steps {
+                dir('Application-Code/frontend') {
+                    sh 'trivy fs . > trivyfs.txt'
+                }
+            }
+        }
+        stage("Docker Image Build") {
+            steps {
+                script {
+                    dir('Application-Code/frontend') {
+                            sh 'docker system prune -f'
+                            sh 'docker container prune -f'
+                            sh 'docker build -t ${FRONTEND_IMAGE}:${BUILD_NUMBER} .'
+                    }
+                }
+            }
+        }
+        stage("ECR Image Pushing") {
+            steps {
+                script {
+                 withDockerRegistry(credentialsId: 'id_docker') {
+                                     docker.image("${FRONTEND_IMAGE}:${BUILD_NUMBER}").push()
+
+                }
+                }
+            }
+        }
+        stage("TRIVY Image Scan") {
+            steps {
+                sh 'trivy image ${FRONTEND_IMAGE}:${BUILD_NUMBER} > trivyimage.txt' 
+            }
+        }
+     
+        stage('Update Deployment file') {
+            environment {
+                GIT_REPO_NAME = "kubernetes-three-tier-devsecops-project"
+                GIT_USER_NAME = "houcem"
+            }
+            steps {
+                dir('Kubernetes-Manifests-file/Frontend') {
+                    withCredentials([string(credentialsId: 'gitlab', variable: 'gitlab')]) { 
+                        sh '''
+                            git config user.email "houcem@gmail.com"
+                            git config user.name "houcem-DevOps"
+                            BUILD_NUMBER=${BUILD_NUMBER}
+                            echo $BUILD_NUMBER
+                            imageTag=$(grep -oP '(?<=frontend-todo:)[^ ]+' deployment.yaml)
+                            echo $imageTag
+                            sed -i "s|${FRONTEND_IMAGE}:${imageTag}|${FRONTEND_IMAGE}:${BUILD_NUMBER}|" deployment.yaml
+                            git add deployment.yaml
+                            git commit -m "Update deployment Image to version \${BUILD_NUMBER}"
+                            git push https://${GIT_USER_NAME}:${gitlab}@repo-dev.efi-academy.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:master
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
